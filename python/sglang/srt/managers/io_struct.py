@@ -232,6 +232,9 @@ class GenerateReqInput:
     return_hidden_states: Union[
         List[ReturnHiddenStatesMode], ReturnHiddenStatesMode
     ] = False
+    # Spec-training capture sink instructions (see spec_capture_sink.py).
+    # Batch-level: List[Optional[dict]]; per-request after __getitem__.
+    spec_capture: Optional[Union[List[Optional[Dict]], Dict]] = None
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
@@ -933,6 +936,11 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            spec_capture=(
+                self.spec_capture[i]
+                if isinstance(self.spec_capture, list)
+                else self.spec_capture
+            ),
         )
         cache[i] = sub
         return sub
@@ -1030,6 +1038,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # encoder_idx assignments stay consistent in the scheduler subprocess.
     # Internal IPC only.
     encoder_urls: Optional[List[str]] = None
+
+    # Spec-training capture sink instructions (see GenerateReqInput.spec_capture)
+    spec_capture: Optional[Dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
@@ -1462,6 +1473,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    # Spec-training capture: one result dict per request (see spec_capture_sink).
+    spec_capture: Optional[List[Any]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1552,6 +1566,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    # Spec-training capture: one result dict per request (see spec_capture_sink).
+    spec_capture: Optional[List[Any]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None

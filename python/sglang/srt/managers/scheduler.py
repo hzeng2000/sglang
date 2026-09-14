@@ -655,6 +655,19 @@ class Scheduler(
 
         self.init_batch_result_processor()
 
+        if server_args.enable_spec_capture:
+            # Capture needs single-pass prefill; chunking would drop all but the
+            # final chunk's hidden rows.
+            if server_args.chunked_prefill_size != -1:
+                raise ValueError(
+                    "--enable-spec-capture requires --chunked-prefill-size -1 "
+                    "(single-pass prefill) so captured hidden states cover the "
+                    "whole sequence"
+                )
+            from sglang.srt import spec_capture_sink
+
+            spec_capture_sink.maybe_init_sink(server_args)
+
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -2432,6 +2445,7 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                spec_capture=recv_req.spec_capture,
             )
             req.tokenizer = self.tokenizer
 
@@ -3578,6 +3592,13 @@ class Scheduler(
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
+    def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
+        """Avoid redundant multi-GiB capture D2H on non-writer TP ranks."""
+        return batch.return_hidden_states and (
+            self.ps.attn_tp_rank == 0
+            or any(req.spec_capture is None for req in batch.reqs)
+        )
+
     @contextmanager
     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
         """Make SB transactional across one forward (overlap and non-overlap).
@@ -3726,7 +3747,9 @@ class Scheduler(
                                 # overlaps.
                                 batch_result.copy_to_cpu(
                                     return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
+                                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                                        batch
+                                    ),
                                 )
                             else:
                                 # Result D2H on copy_stream overlaps the next forward
@@ -3736,7 +3759,9 @@ class Scheduler(
                                 with self.copy_stream_ctx:
                                     batch_result.copy_to_cpu(
                                         return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
+                                        return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                                            batch
+                                        ),
                                     )
                         else:
                             batch_result.future_indices = future_indices
@@ -3775,7 +3800,9 @@ class Scheduler(
                 batch_result.copy_done = self.device_module.Event()
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
-                    return_hidden_states=batch.return_hidden_states,
+                    return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                        batch
+                    ),
                 )
             else:
                 kwargs = (
@@ -3905,7 +3932,9 @@ class Scheduler(
         with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
+                return_hidden_states=self._should_copy_hidden_states_to_cpu(
+                    cur_batch
+                ),
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
@@ -3924,6 +3953,11 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        # Complete capture transfers on the scheduler thread before processing
+        # any kind of next result (prefill, decode, or idle).  This preserves
+        # the output socket's single-thread ownership under mixed traffic.
+        self.batch_result_processor.drain_spec_captures()
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -4043,6 +4077,15 @@ class Scheduler(
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
+        # A capture response is intentionally delayed until its background
+        # sink transfer completes; finish it on this thread so ownership of
+        # the ZeroMQ output socket remains single-threaded.  Do not enter the
+        # idle sleeper while a future is outstanding or the producer waiting
+        # for that response could deadlock.
+        self.batch_result_processor.drain_spec_captures()
+        if self.batch_result_processor.has_pending_spec_captures():
+            time.sleep(0.001)
+            return
         if not self.is_fully_idle():
             return
 
@@ -4093,6 +4136,7 @@ class Scheduler(
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
+            and not self.batch_result_processor.has_pending_spec_captures()
             and self._pp_microbatches_drained()
         )
 

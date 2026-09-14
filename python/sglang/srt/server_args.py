@@ -3511,6 +3511,29 @@ class ServerArgs:
         ),
         NS("exec.features"),
     ] = None
+    enable_spec_capture: A[
+        bool,
+        "Enable server-side speculative-training capture: per-request aux/last "
+        "hidden states are written to a Mooncake store (SpecForge DataFlow "
+        "layout) instead of the response payload. Enables aux-hidden-state "
+        "capture on the target model without a speculative draft worker.",
+        NS("exec.features"),
+    ] = False
+    spec_capture_aux_layer_ids: A[
+        Optional[List[int]],
+        "Target layer ids whose hidden states are captured (concatenated) for "
+        "spec-capture requests. Defaults to the model's EAGLE3 default layers "
+        "(low/mid/high) when unset.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_method: A[
+        str,
+        "Capture method for --enable-spec-capture: 'eagle3', 'dflash', or "
+        "'dspark'. Must match the draft strategy being trained; they wire "
+        "capture onto different submodules (VL targets only populate the "
+        "dflash path; dspark rides the dflash aux plumbing).",
+        NS("exec.features"),
+    ] = "eagle3"
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",
