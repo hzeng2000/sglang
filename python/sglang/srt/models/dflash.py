@@ -536,6 +536,23 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
+        dflash_config = getattr(config, "dflash_config", {})
+        self.is_domino = dflash_config.get("projector_type") == "domino"
+        if self.is_domino:
+            if dflash_config["pure_draft_prefix_len"] != 1:
+                raise ValueError("Domino requires pure_draft_prefix_len=1.")
+            self.shift_label = bool(dflash_config["shift_label"])
+            gru_hidden_dim = int(dflash_config["gru_hidden_dim"])
+            emb_dim = int(dflash_config["emb_dim"])
+            self.prefix_gru = nn.GRU(
+                hidden_size, gru_hidden_dim, batch_first=True, bias=False
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(hidden_size + gru_hidden_dim, emb_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(emb_dim, int(config.vocab_size), bias=False),
+            )
+
     def set_block_size(self, block_size: int) -> None:
         """Adopt the block size the worker resolved.
 
@@ -619,6 +636,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_domino_params = set()
 
         # Alias the native export's "encoder." names.
         _VENDOR_ENCODER_ALIASES = {
@@ -672,6 +690,18 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")):
+                    loaded_domino_params.add(resolved_name)
+
+        if self.is_domino:
+            required = {
+                name for name in params_dict
+                if name.startswith(("prefix_gru.", "embed_proj."))
+            }
+            if missing := required - loaded_domino_params:
+                raise ValueError(
+                    f"Domino checkpoint is missing head weights: {sorted(missing)}"
+                )
 
 
 class DFlashLagunaAttention(DFlashAttention):

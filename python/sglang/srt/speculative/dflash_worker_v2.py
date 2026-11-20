@@ -46,6 +46,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
+from sglang.srt.speculative.domino_utils import domino_greedy_rollout
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -251,6 +252,28 @@ class _SelectorDraftSampler:
         self.q_out[:bs].copy_(q_rows)
 
 
+class _DominoDraftSampler:
+    """Capture the causal correction head together with the draft backbone."""
+
+    def __init__(self, *, block_size, max_bs, **rollout_args):
+        self.block_size = block_size
+        self.rollout_args = rollout_args
+        self.out = torch.empty(
+            (max_bs * (block_size - 1),),
+            dtype=torch.int64,
+            device=rollout_args["lm_head_weight"].device,
+        )
+
+    def __call__(self, hidden_states, input_ids):
+        bs = hidden_states.shape[0] // self.block_size
+        proposals = domino_greedy_rollout(
+            draft_hidden=hidden_states.view(bs, self.block_size, -1),
+            verified_ids=input_ids.view(bs, self.block_size)[:, 0],
+            **self.rollout_args,
+        )
+        self.out[: proposals.numel()].copy_(proposals.reshape(-1))
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -300,6 +323,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
+        self._is_domino = getattr(self.draft_model, "is_domino", False)
+        self._domino_rollout_args = None
+        if self._is_domino:
+            target_model = self._target_worker.model_runner.model
+            lm_head = target_model.lm_head
+            if get_tp_group().world_size != 1 or not is_dense_head_weight(
+                lm_head.weight
+            ):
+                raise NotImplementedError(
+                    "Domino currently requires TP=1 and a dense LM head."
+                )
+            pool_size = server_args.speculative_domino_candidate_pool_size
+            if pool_size < 0:
+                raise ValueError("Domino candidate pool size must be non-negative.")
+            self._domino_rollout_args = dict(
+                target_embedding=target_model.get_input_embeddings(),
+                lm_head_weight=lm_head.weight,
+                prefix_gru=self.draft_model.prefix_gru,
+                embed_proj=self.draft_model.embed_proj,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
+                shift_label=self.draft_model.shift_label,
+                candidate_pool_size=pool_size,
+            )
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -343,6 +389,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.draft_window_size,
                 self.use_compact_draft_cache,
             )
+            if self._is_domino:
+                logger.info(
+                    "Domino head enabled: shift_label=%s, candidate_pool_size=%s, proposals=%s.",
+                    self.draft_model.shift_label,
+                    self._domino_rollout_args["candidate_pool_size"],
+                    self.block_size - 1,
+                )
             logger.info(
                 "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s, noise_embed_scale=%s",
                 self._mask_token,
@@ -487,6 +540,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
+
+        if self._is_domino:
+            logger.info("DFLASH Domino rollout folded into the draft cuda graph.")
+            return _DominoDraftSampler(
+                block_size=self.block_size,
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                **self._domino_rollout_args,
+            )
 
         if self.selector is not None:
             # compute_candidates needs the target lm_head attached before capture.
@@ -1904,6 +1965,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.candidate_out[:bs],
                     self._draft_sampler.q_out[:bs],
                 )
+        elif self._is_domino:
+            draft_next = domino_greedy_rollout(
+                draft_hidden=draft_logits_output.hidden_states.view(
+                    bs, self.block_size, -1
+                ),
+                verified_ids=block_ids[:, 0],
+                **self._domino_rollout_args,
+            )
         elif self.selector is not None:
             draft_next = self._propose_selector_block(
                 draft_logits_output=draft_logits_output,
